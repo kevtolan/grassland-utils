@@ -22,16 +22,31 @@ library(patchwork)
 
 # download political boundaries
 towns <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_towns_SP_v1/FeatureServer/0",
-                                   out_fields = c("TOWNNAMEMC")) %>% st_transform(crs = 32145) %>% st_make_valid()#%>% st_buffer(10) #hydrology polygons
-counties <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_counties_SP_v1/FeatureServer/0",
-                           out_fields = c("CNTYNAME")) %>% st_transform(crs = 32145) %>% st_make_valid()#%>% st_buffer(10) #hydrology polygons
+                                   out_fields = c("TOWNNAMEMC")) %>% st_transform(crs = 32145) %>% st_make_valid()
 
-# download agr cover from 2016 and 2022, filter to exclude row crops
-temp_zip <- tempfile(fileext = ".zip")
+counties <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_counties_SP_v1/FeatureServer/0",
+                           out_fields = c("CNTYNAME")) %>% st_transform(crs = 32145) %>% st_make_valid()
+
+parcels <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Cadastral_VTPARCELS_poly_standardized_parcels_SP_v1/FeatureServer/0",
+                             out_fields = c("OBJECTID","SPAN")) %>% st_transform(crs = 32145) %>% st_make_valid()
+
+
+VT_soils <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Geologic_SO_poly_SP_v1/FeatureServer/0",
+                              out_fields = c("OBJECTID","PRIME")) %>% st_transform(crs = 32145) %>% st_make_valid() %>%
+                              filter(!PRIME %in% c("NPSL","Not rated", "", " ")) %>%
+                              st_simplify(dTolerance = 1, preserveTopology = T)
+
+# bobo_conservation_plannding <- st_read('~/QGIS/EAME/BOBO_Opp_Map.shp')
+
+temp_zip22 <- tempfile(fileext = ".zip")
+temp_zip16 <- tempfile(fileext = ".zip")
 temp_dir <- tempdir()
 
-download.file("https://s3.us-east-2.amazonaws.com/vtopendata-prd/Landcover/_Packaged_Zips/LandLandcov_Agriculture2022.zip", destfile = temp_zip, mode = "wb")
-unzip(temp_zip, exdir = temp_dir)
+download.file("https://s3.us-east-2.amazonaws.com/vtopendata-prd/Landcover/_Packaged_Zips/LandLandcov_Agriculture2022.zip", destfile = temp_zip22, mode = "wb")
+unzip(temp_zip22, exdir = temp_dir)
+
+download.file("https://s3.us-east-2.amazonaws.com/vtopendata-prd/Landcover/_Packaged_Zips/LandLandcov_Agriculture2016.zip", destfile = temp_zip16, mode = "wb")
+unzip(temp_zip16, exdir = temp_dir)
 
 VT_hay_pasture_22 <- st_read(dsn = paste0(temp_dir, "/LandLandcov_Agriculture2022/LandLandcov_Agriculture2022.gdb"),
                         layer = "LandLandcov_Agriculture2022_poly") %>%
@@ -39,17 +54,21 @@ VT_hay_pasture_22 <- st_read(dsn = paste0(temp_dir, "/LandLandcov_Agriculture202
   dplyr::filter(Class != 'Crops') %>%
   mutate(area_ha = Shape_Area/10000,
          area_ac = Shape_Area*0.000247105,
-         perim_area = Shape_Length/Shape_Area) %>%
+         perim_area = Shape_Length/Shape_Area,
+         sourceyear = '2022') %>%
   filter(perim_area <= 0.03,
          area_ac >= 10) %>%
-  st_simplify(dTolerance = 5, preserveTopology = T) %>%
-  st_join(towns) %>%
-  st_join(counties)
+  st_simplify(dTolerance = 1, preserveTopology = T) %>%
+  st_intersection(parcels) %>%
+  st_intersection(towns) %>%
+  st_intersection(counties) %>%
+  dplyr::select(!c('gridcode'))
 
 
+VT_hay_pasture_22_soils <- VT_hay_pasture_22 %>%
+  st_intersection(VT_soils)
 
-download.file("https://s3.us-east-2.amazonaws.com/vtopendata-prd/Landcover/_Packaged_Zips/LandLandcov_Agriculture2016.zip", destfile = temp_zip, mode = "wb")
-unzip(temp_zip, exdir = temp_dir)
+st_write(VT_hay_pasture_22_soils,"~/R/Grasslab hab/VT_hay_pasture_22_soils.geojson")
 
 VT_hay_pasture_16 <- st_read(dsn = paste0(temp_dir, "/LandLandcov_Agriculture2016/LandLandcov_Agriculture2016.gdb"),
                              layer = "LandLandcov_Agriculture2016_poly") %>%
@@ -57,7 +76,27 @@ VT_hay_pasture_16 <- st_read(dsn = paste0(temp_dir, "/LandLandcov_Agriculture201
   dplyr::filter(Class != 'Crops') %>%
   mutate(area_ha = Shape_Area/10000,
          area_ac = Shape_Area*0.000247105,
-         perim_area = Shape_Length/Shape_Area) %>%
+         perim_area = Shape_Length/Shape_Area,
+         sourceyear = '2016') %>%
   filter(perim_area <= 0.03,
          area_ac >= 10) %>%
-  st_simplify(dTolerance = 1)
+  st_simplify(dTolerance = 1, preserveTopology = T) %>%
+  st_intersection(parcels) %>%
+  st_intersection(towns) %>%
+  st_intersection(counties) %>%
+  dplyr::select(!c('gridcode'))
+
+
+VT_hay_pasture_16_soils <- VT_hay_pasture_16 %>%
+  st_intersection(VT_soils)
+
+st_write(VT_hay_pasture_16_soils,"~/R/Grasslab hab/VT_hay_pasture_16_soils.geojson")
+
+hay_16_union <- st_union(st_geometry(VT_hay_pasture_16))
+hay_22_union <- st_union(st_geometry(VT_hay_pasture_22))
+
+VT_lost_gland <- st_difference(VT_hay_pasture_16, hay_22_union) %>%
+  mutate(Status = "lost")
+
+VT_gained_gland <- st_difference(VT_hay_pasture_22, hay_16_union) %>%
+  mutate(Status = "gained")
