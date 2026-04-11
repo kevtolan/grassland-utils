@@ -41,7 +41,7 @@ VT_hay_pasture_22 <- st_read(dsn = paste0(temp_dir, "/LandLandcov_Agriculture202
          perim_area = Shape_Length/Shape_Area,
          sourceyear = '2022') %>%
   filter(#perim_area <= 0.03,
-         area_ac >= 1) %>%
+    area_ac >= 1) %>%
   st_simplify(dTolerance = 1, preserveTopology = T) %>%
   dplyr::select(!c('gridcode'))
 
@@ -64,7 +64,7 @@ parcels_joined <- parcels %>%
   mutate(has_landtrans = as.factor(as.integer(lengths(st_intersects(., landtrans)) > 0)))
 
 VT_sig_soils <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Geologic_SOAG_poly_SP_v1/FeatureServer/0",
-                              out_fields = c("OBJECTID","PRIME")) %>% st_transform(crs = 32145) %>% st_make_valid() %>%
+                                  out_fields = c("OBJECTID","PRIME")) %>% st_transform(crs = 32145) %>% st_make_valid() %>%
   filter(!PRIME %in% c("NPSL","Not rated", "", " ")) %>%
   st_simplify(dTolerance = 1, preserveTopology = T) %>%
   rename(SoilID = OBJECTID,
@@ -87,7 +87,7 @@ VT_hay_pasture_22_parcels <- soils_clean %>% st_intersection(parcels_joined) %>%
   mutate(rowID = row_number())
 
 output_dir <- file.path(temp_dir, "masked_openness")
-  if(!dir.exists(output_dir)) dir.create(output_dir)
+if(!dir.exists(output_dir)) dir.create(output_dir)
 
 results_list <- list()
 
@@ -97,9 +97,13 @@ for (i in seq_along(openness_files)) {
   r <- rast(r_path)
 
   hay_vect_cropped <- st_crop(VT_hay_pasture_22_parcels,r)
+
+  if (nrow(hay_vect_cropped) == 0) {
+    message(paste0("Skipping tile ", i, ": No overlapping parcels found."))
+    next
+  }
+
   hay_vect <- vect(hay_vect_cropped)
-
-
 
   if(crs(r) != crs(hay_vect)) {
     r <- project(r, crs(hay_vect))
@@ -108,16 +112,18 @@ for (i in seq_along(openness_files)) {
   r_masked <- crop(r, hay_vect) %>%
     mask(hay_vect)
 
-  stats <- terra::extract(r_masked, hay_vect, fun = mean, na.rm = TRUE)
+  hay_sf <- st_as_sf(hay_vect)
 
-  hay_stats <- cbind(as.data.frame(hay_vect), Open_decimal = stats$Open_decimal)
+  means <- exact_extract(r_masked, hay_sf, 'mean', progress = FALSE)
 
-  results_list[[i]] <- hay_stats
+  hay_sf$Open_decimal <- means
 
-  out_name <- paste0("masked_", basename(r_path))
-  writeRaster(r_masked, file.path(output_dir, out_name), overwrite = TRUE)
+  results_list[[i]] <- st_drop_geometry(hay_sf)
 
-  rm(r, r_masked, stats,hay_stats)
+  # out_name <- paste0("masked_", basename(r_path))
+  # writeRaster(r_masked, file.path(output_dir, out_name), overwrite = TRUE)
+
+  rm(r, r_masked, hay_sf,means)
   gc()
 
   message(paste0("Finished tile ", i, " of ", length(openness_files)))
@@ -133,27 +139,5 @@ hay_pasture_stats <- VT_hay_pasture_22_parcels %>%
 
 
 mapview(hay_pasture_stats[hay_pasture_stats$mean_openness > 0.7,] %>% filter(!is.na(mean_openness)), zcol = "mean_openness")
-
-
-
-
-
-
-
-
-towns <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_towns_SP_v1/FeatureServer/0",
-                                   out_fields = c("TOWNNAMEMC")) %>% st_transform(crs = 32145) %>% st_make_valid()
-
-counties <- get_spatial_layer("https://services1.arcgis.com/BkFxaEFNwHqX3tAw/ArcGIS/rest/services/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_counties_SP_v1/FeatureServer/0",
-                              out_fields = c("CNTYNAME")) %>% st_transform(crs = 32145) %>% st_make_valid()
-
-
-
-hay_pasture_stats_towns <- hay_pasture_stats %>%
-  # st_transform(crs = 32145) %>% st_make_valid() %>%
-  # filter(perim_area <= 0.03,
-  #        area_ac >= 10) %>%
-  st_intersection(towns) %>%
-  st_intersection(counties)
 
 
