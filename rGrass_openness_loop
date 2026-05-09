@@ -109,9 +109,7 @@ for (region in names(dsm_urls)) {
 
     tryCatch({
 
-      dsm_cog_url_worker <- rast(paste0("/vsicurl/", region_url) |>
-                                   gsub("^/vsicurl//vsicurl/", "/vsicurl/", x = _))
-      dsm_cog_url_worker <- rast(region_url)
+dsm_cog_url_worker <- rast(region_url)
 
       dsm_cog <- crop(dsm_cog_url_worker, blockbound) %>%
         project("EPSG:32145", method = "bilinear")
