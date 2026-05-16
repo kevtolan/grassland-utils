@@ -39,7 +39,7 @@ VT_agr_22 <- st_read(dsn = paste0(td, "/LandLandcov_Agriculture2022/LandLandcov_
 
 # vt_blocks <- get_spatial_layer("https://services1.arcgis.com/d3OaJoSAh2eh6OA9/ArcGIS/rest/services/Vermont_Wildlife_Atlasing_Blocks/FeatureServer/0",
                                # out_fields = c("BLOCKNAME","QUADNAME","GEOUNITDES")) %>% st_transform(crs = 32145) # download grid
-vt_blocks <- st_read('/Users/kevintolan/R/R_Spatial/BBA_Blocks/VT03_grid.shp') %>% st_transform(crs = 32145)
+vt_blocks <- st_read('~/R/R_Spatial/BBA_Blocks/VT03_grid.shp') %>% st_transform(crs = 32145)
 
 aoi <- vt_blocks
 
