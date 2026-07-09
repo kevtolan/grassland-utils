@@ -35,7 +35,7 @@ raster_paths <- c(
 coords <- as.numeric(strsplit(point_str, ", ")[[1]])
 pt_wgs84 <- vect(matrix(c(coords[2], coords[1]), ncol=2), crs="+proj=longlat +datum=WGS84")
 
-pt_metric <- project(pt_wgs84, "+proj=utm +zone=18 +datum=WGS84 +units=m") # Local UTM zone for Vermont
+pt_metric <- project(pt_wgs84, "+proj=utm +zone=18 +datum=WGS84 +units=m")
 bbox_metric <- buffer(pt_metric, width = 250)
 
 matching_raster_path <- NULL
@@ -73,40 +73,16 @@ if (!is.null(target_raster)) {
 
   raster_crop <- crop(target_raster, ext(bbox_raster_crs))
 
-
   print(raster_crop)
 } else {
   stop("The point does not overlap with any of the provided rasters.")
 }
 
 
-# lake <- st_read('/Users/kevintolan/R/Grasslab hab/spat/VT_Lake_Champlain_(extracted_from_VHDCARTO)_-_polygon.shp') %>%
-          # st_transform(32145)
-# lakemem <- st_read('/Users/kevintolan/QGIS/Spatial Data/Lake_Memphremagog.shp') %>%
-#   st_transform(32145)
-
-# vt_towns <- st_read('/Users/kevintolan/R/R_Spatial/spat/FS_VCGI_OPENDATA_Boundary_BNDHASH_poly_towns_SP_v1.shp') %>%
-#           st_transform(32145)
-# townofinterest <- vt_towns %>% filter(TOWNNAMEMC %in% c('Shelburne','Charlotte'))
-# outline <- vect('/Users/kevintolan/QGIS/Grad/Shelb.shp')
-
-#
-# r1 <- rast('/Users/kevintolan/Desktop/trews.tif')
-# r2 <- rast('/Users/kevintolan/Desktop/y6gtfre.tif')
-#
-# r3 <- merge(r1,r2)
-# r3 <- raster(r3)
-#
-# # site <-
 r <- raster(raster_crop)
 crs(r) <- CRS('+init=EPSG:32145')
 r1 <- rast(r)
 plot(r1)
-
-# r1masked <- mask(r, lake, inverse = T)
-# r1 <- rast(r1masked)
-
-# rcrop <- terra::crop(r, townofinterest, mask = TRUE, ext = T)
 
 td <- tempdir()
 loc <- initGRASS(gisBase= '/Applications/GRASS-8.2.app/Contents/Resources',
