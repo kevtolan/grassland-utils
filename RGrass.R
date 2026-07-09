@@ -1,7 +1,6 @@
 # open grassGIS CLI
 # enter 'open -na Rstudio' in console
 
-
 library(tidyverse)
 library(sf)
 library(ggmap)
@@ -23,16 +22,14 @@ library(cowplot)
 # library(usethis)
 # edit_r_environ()
 
-# point_str <- '43.66086759147965, -73.3608887087686'
 
-point_str <- '44.24459, -73.24040'
+coord_str <- '44.24459, -73.24040'
 raster_paths <- c(
   north   = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Northern/Northern_2023_35cm_DSMFR.tif",
   central = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Central/Central_2023_35cm_DSMFR.tif",
-  south   = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Southern/Southern_2023_35cm_DSMFR.tif"
-)
+  south   = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Southern/Southern_2023_35cm_DSMFR.tif")
 
-coords <- as.numeric(strsplit(point_str, ", ")[[1]])
+coords <- as.numeric(strsplit(coord_str, ", ")[[1]])
 pt_wgs84 <- vect(matrix(c(coords[2], coords[1]), ncol=2), crs="+proj=longlat +datum=WGS84")
 
 pt_metric <- project(pt_wgs84, "+proj=utm +zone=18 +datum=WGS84 +units=m")
