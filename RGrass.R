@@ -4,14 +4,14 @@
 
 library(tidyverse)
 library(sf)
-library(terra)
 library(ggmap)
+library(terra)
 library(mapview)
 library(leaflet)
-library(ggspatial)
 library(tmap)
 library(leafem)
 library(sp)
+library(ggspatial)
 library(ks)
 library(raster)
 library(grid)
@@ -21,12 +21,99 @@ library(rnaturalearth)
 library(rgrass)
 library(cowplot)
 
-ropen <- rast('/Users/kevintolan/R/Grasslab hab/LiDAR/UpperMeadows_open.tif') %>%
+coord_str <- '44.444451647224255, -73.04599891701561'
+raster_paths <- c(
+  statewide = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2023_35cm_DSMFR.tif"
+)
+
+coords <- as.numeric(strsplit(coord_str, ", ")[[1]])
+pt_wgs84 <- vect(matrix(c(coords[2], coords[1]), ncol=2), crs="+proj=longlat +datum=WGS84")
+
+pt_metric <- project(pt_wgs84, "+proj=utm +zone=18 +datum=WGS84 +units=m") # Local UTM zone for Vermont
+bbox_metric <- buffer(pt_metric, width = 250)
+
+matching_raster_path <- NULL
+target_raster <- NULL
+
+for (name in names(raster_paths)) {
+  r <- rast(raster_paths[name])
+  pt_raster_crs <- project(pt_wgs84, crs(r))
+
+  pt_coords <- crds(pt_raster_crs)
+  e <- ext(r)
+
+  if (pt_coords[1] >= e$xmin && pt_coords[1] <= e$xmax &&
+      pt_coords[2] >= e$ymin && pt_coords[2] <= e$ymax) {
+
+    cat("Point overlaps with the", name, "raster.\n")
+    matching_raster_path <- raster_paths[name]
+    target_raster <- r
+    break
+  }}
+
+if (!is.null(target_raster)) {
+  bbox_raster_crs <- project(bbox_metric, crs(target_raster))
+
+  raster_crop <- crop(target_raster, ext(bbox_raster_crs))
+
+  print(raster_crop)
+} else {
+  stop("The point does not overlap with any of the provided rasters.")
+}
+
+
+if (!is.null(target_raster)) {
+  bbox_raster_crs <- project(bbox_metric, crs(target_raster))
+
+  raster_crop <- crop(target_raster, ext(bbox_raster_crs))
+
+
+  print(raster_crop)
+} else {
+  stop("The point does not overlap with any of the provided rasters.")
+}
+
+
+lake <- st_read('~/R/Grasslab hab/spat/VT_Lake_Champlain_(extracted_from_VHDCARTO)_-_polygon.shp') %>%
+          st_transform(32145)
+
+r <- raster(raster_crop)
+crs(r) <- CRS('+init=EPSG:32145')
+
+r1masked <- mask(r, lake, inverse = T)
+r1 <- rast(r1masked)
+
+td <- tempdir()
+loc <- initGRASS(gisBase= '/Applications/GRASS-8.2.app/Contents/Resources',
+                 home = td,
+                 SG = r1,
+                 override = TRUE)
+write_RAST(r1, vname="rmask")
+
+start <- Sys.time()
+
+execGRASS("r.skyview", flags=c("o","overwrite"),
+          input= 'rmask', output = 'rmask.Open')
+
+end <- Sys.time()
+elapsed <- difftime(end, start, units = "hours")
+
+difftime(end, start, unit="hours")
+message("Time elapsed: ", round(elapsed, 3), " hours")
+
+u1 <- read_RAST('rmask.Open')
+
+u2 <- u1
+u1[u1[] >= 1 ] <- NA
+u1[u1[] <= .8 ] <- NA
+
+ropen <- u1 %>%
   project('EPSG:4326')
 
 names(ropen) <- c("opennness")
 
-ropendf <-   as.data.frame(ropen, xy = TRUE) %>% na.omit()
+ropendf <-   as.data.frame(ropen, xy = TRUE) %>%
+  na.omit()
 
 bbox <- st_bbox(ropen)
 
@@ -35,15 +122,17 @@ bbox84 <- bbox %>% st_transform(4326)
 lon_center <- (bbox84["xmin"] + bbox84["xmax"]) / 2
 lat_center <- (bbox84["ymin"] + bbox84["ymax"]) / 2
 
-sat_map <- get_map(location = c(lon_center, lat_center), zoom = 15, maptype = 'satellite')
+sat_map <- get_map(location = c(lon_center, lat_center), zoom = 16, maptype = 'satellite')
 
 ggmap(sat_map) +
   geom_raster(data = ropendf, aes(x = x, y = y, fill = opennness*0.9*100), alpha = 0.75) +
-  scale_fill_gradientn(
-    colors = c("#5e3c99","#4175b4","#4da49b","#a6dba0","#e6f598","#ffffbf","#fee08b","#fdae61","#f46d43","#d73027","#a50026"),
-    name = "    Mean\nopenness (º)", limits = c(70, 90), breaks = seq(70, 90, by = 5), oob = scales::squish, na.value = "#ebf2fa",
-    guide = guide_colourbar(barwidth = 1, barheight = 10, frame.colour = "black", title.vjust = 0.8)) +
-  coord_sf(xlim = c(bbox84[1]+0.001, bbox84[3]-0.001), ylim = c(bbox84[2]+0.001, bbox84[4]-0.001), crs = 4326) +
+  scale_fill_gradientn(colors = c("#5e3c99","#4175b4","#4da49b","#a6dba0",
+                                  "#e6f598","#ffffbf","#fee08b","#fdae61",
+                                  "#f46d43","#d73027","#a50026"),
+                       name = "    Mean\nopenness (º)",limits = c(70, 90), breaks = seq(70, 90, by = 5), oob = scales::squish, na.value = "#ebf2fa",
+                       guide = guide_colourbar(barwidth = 2, barheight = 25, frame.colour = "black",title.vjust = 0.8)) +
+  coord_sf(xlim = c(bbox84[1], bbox84[3]), ylim = c(bbox84[2], bbox84[4]), crs = 4326) +
+  # coord_sf(xlim = c(bbox84[1]+0.003, bbox84[3]-0.005), ylim = c(bbox84[2]+0.001, bbox84[4]-0.001), crs = 4326) +
   labs(x = "Longitude", y = 'Latitude') +
   annotation_scale(aes(text_col = 'white', line_col = 'white',
                        width_hint = 0.4), height = unit(0.5, "cm"), text_cex = 1) +
@@ -54,6 +143,10 @@ ggmap(sat_map) +
     style = ggspatial::north_arrow_fancy_orienteering(
       fill = c("black", "white"),
       line_col = "white",
-      text_size = 10,
-      text_col = "white"))
+      text_size = 15,
+      text_col = "white")) +
+  theme(axis.title=element_text(size=20, face = "bold"),
+        axis.text=element_text(size=15),
+        legend.title = element_text(size = 20,face="bold"),
+        legend.text = element_text(size = 15))
 
