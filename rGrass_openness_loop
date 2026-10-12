@@ -1,156 +1,235 @@
-# open grassGIS CLI
-# enter 'open -na Rstudio' in console
+# ==== Eye-level openness for Vermont Breeding Bird Atlas blocks ====
+# Computes openness (GRASS r.skyview, openness mode) for every BBA block from the statewide 2023 lidar, one GeoTIFF
+# per block, then optionally splits each block into openness-class polygons.
+#
+# Method
+#  - Surface = max(DSM, DTM + eye height) per cell, so openness is measured from eye level (Keyel et al. 2012):
+#    ground cover below eye height doesn't block the view; trees, hedgerows and buildings do.
+#  - Each block is processed with context_m of surrounding land (so edge cells "see" past the block), then cropped back.
+#  - r.skyview's horizon search is capped at max_dist_m.
+#
+# Requirements
+#  - GRASS GIS 8.5 (8.5+ so r.horizon accepts nprocs), with the r.skyview addon:
+#    at a GRASS prompt run  g.extension r.skyview
+#  - R packages: tidyverse, sf, terra, cli, rgrass, future, furrr
+#  - On macOS, start R/RStudio from a GRASS prompt (e.g. open -na RStudio) so rgrass finds GRASS
+#  - Disk: ~520 MB per finished block (~610 GB for all 1,178), plus a few GB of temp space per worker
+#
+# Re-running skips blocks that already have a tif, so the loop can be stopped and restarted at any time.
 
-library(tidyverse) # data manipulation, workflow
-library(sf) # vector data
-library(terra) # raster data
-library(arcpullr) # download ESRI-hosted data
-library(cli) # color outputs
-library(beepr) # beep when error
-library(mapview)
-library(ks)
-library(grid)
-library(gridExtra)
-library(classInt)
+library(tidyverse)
+library(sf)
+library(terra)
+library(cli)
 library(rgrass)
 library(future)
 library(furrr)
 
-td <- tempdir()
-out_dir <- '~/R/Grasslab hab/LiDAR_Loop'
-temp_zip22 <- tempfile(fileext = ".zip")
 
-download.file("https://s3.us-east-2.amazonaws.com/vtopendata-prd/Landcover/_Packaged_Zips/LandLandcov_Agriculture2022.zip",
-              destfile = temp_zip22, mode = "wb")
-unzip(temp_zip22, exdir = td)
+# ---- Settings: edit these for your computer ----
+blocks_path <- "path/to/BBA_Blocks/VT03_grid.shp"                 # BBA block polygons (field BLOCKNAME)
+out_root    <- "path/to/output"                                   # block tifs go in a subfolder of this
+grass_base  <- "/Applications/GRASS-8.5.app/Contents/Resources"   # GRASS install (macOS default shown)
+addon_base  <- "~/Library/GRASS/GRASS8/Addons8.5"                 # where g.extension installed r.skyview
+ram_gb      <- 36                                                 # your computer's RAM, in GB
+n_workers   <- 6                                                  # blocks processed at once (~4-6 GB RAM each)
 
-VT_agr_22 <- st_read(dsn = paste0(td, "/LandLandcov_Agriculture2022/LandLandcov_Agriculture2022.gdb"),
-                     layer = "LandLandcov_Agriculture2022_poly") %>%
-  st_transform(crs = 32145) %>% st_make_valid() %>%
-  # dplyr::filter(Class != 'Crops') %>%
-  # mutate(area_ha = Shape_Area/10000,
-  # area_ac = Shape_Area*0.000247105,
-  # perim_area = Shape_Length/Shape_Area,
-  # sourceyear = '2022') %>%
-  # filter(perim_area <= 0.03,
-  # area_ac >= 10) %>%
-  st_simplify(dTolerance = 1, preserveTopology = T) %>%
-  dplyr::select(!c('gridcode'))
+eye_height_m <- 1.61   # eye level (Keyel et al. 2012)
+context_m    <- 100    # land around each block included in the skyview run, cropped off before saving
+max_dist_m   <- 500    # r.skyview maxdistance: how far each cell searches for its horizon (NULL = no limit)
 
-
-
-# === Setup ===
-vt_blocks <- st_read('/Users/kevintolan/R/R_Spatial/BBA_Blocks/VT03_grid.shp') %>%
-  st_transform(crs = 32145)
-
-dsm_urls <- list(
-  central = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Central/Central_2023_35cm_DSMFR.tif",
-  south   = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Southern/Southern_2023_35cm_DSMFR.tif",
-  north   = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/_Other/Projects/2023_Lidar/PreliminaryData/Northern/Northern_2023_35cm_DSMFR.tif"
+# Statewide lidar (VCGI, Cloud Optimized GeoTIFFs read directly from the web). Uncomment "2013" (2013-2017 70 cm
+# lidar) to also run it, queued after 2023.
+lidar_years <- list(
+  "2023" = list(dsm_url = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2023_35cm_DSMFR.tif",
+                dem_url = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2023_35cm_DEMHF.tif")
+  # "2013" = list(dsm_url = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2013-2017_70cm_DSM.tif",
+  #               dem_url = "/vsicurl/https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2013-2017_70cm_DEMHF.tif")
 )
 
-plan(multisession, workers = 8)
 
-for (region in names(dsm_urls)) {
+# ---- Setup ----
+# Threads per r.horizon. GRASS 8.5 otherwise uses every core in EACH worker, which swamps the CPU;
+# split the cores between workers instead.
+nprocs_per_worker <- max(1, floor(parallel::detectCores() / n_workers))
 
-  message("\n=== Processing region: ", region, " ===")
+td <- tempdir()
+# Output folder named by settings so results with different settings don't mix
+out_dirs <- map_chr(names(lidar_years), \(yr) file.path(out_root, paste0('LiDAR_Loop_eye', eye_height_m, 'm',
+                                                     if (!is.null(max_dist_m)) paste0('_maxd', max_dist_m, 'm'), '_', yr))) %>%
+  set_names(names(lidar_years))
+walk(out_dirs, \(d) dir.create(d, showWarnings = FALSE, recursive = TRUE))
+dsm_crs <- crs(rast(lidar_years[[1]]$dsm_url))
 
-  dsm_cog_url <- rast(dsm_urls[[region]])
-  raster_extent <- ext(dsm_cog_url)
-  bbox_poly <- as.polygons(raster_extent, crs = crs(dsm_cog_url)) %>%
-    project("EPSG:32145")
+vt_blocks <- st_read(blocks_path) %>%
+  st_transform(dsm_crs)
+blocks <- unique(vt_blocks$BLOCKNAME)
 
-  cropped_blocks <- st_crop(vt_blocks, bbox_poly)
-  bb <- st_bbox(cropped_blocks) %>% st_as_sfc() %>% st_as_sf()
-  blocks_subset <- cropped_blocks[st_intersects(cropped_blocks, bb, sparse = FALSE), ]
-  blocks <- unique(blocks_subset$BLOCKNAME)
+# One job per block per year (blocks that already have a tif are left out). Each job carries just its own boundary
+# and URLs, so each worker only receives its piece.
+jobs <- list()
+for (yr in names(lidar_years)) {
+  out_files <- file.path(out_dirs[[yr]], paste0(blocks, "_open.tif"))
+  done <- file.exists(out_files)
+  message(yr, ":  blocks ", length(blocks), " | done ", sum(done), " | remaining ", sum(!done))
+  jobs <- c(jobs, map(blocks[!done], \(i) c(
+    list(year = yr, name = i, blockbound = vt_blocks[vt_blocks$BLOCKNAME == i, ],
+         out_file = file.path(out_dirs[[yr]], paste0(i, "_open.tif"))),
+    lidar_years[[yr]])))
+}
+n_jobs <- length(jobs)
 
-  existing_files  <- list.files(out_dir, pattern = "\\.tif$")
-  existing_blocks <- gsub("_open\\.tif$", "", existing_files)
-
-  all_out_files     <- file.path(out_dir, paste0(blocks, "_open.tif"))
-  missing_indices   <- !file.exists(all_out_files)
-  blocks_to_process <- blocks[missing_indices]
-
-  message("  Blocks in region:     ", length(blocks))
-  message("  Already done:         ", sum(!missing_indices))
-  message("  Remaining to process: ", length(blocks_to_process))
-
-  if (length(blocks_to_process) == 0) {
-    message("  All blocks complete — skipping region.")
-    next
+# Clean up leftovers from earlier runs that crashed or were killed (their temp folders never got deleted):
+# GRASS session temp folders (grass8-<user>-<pid>) whose process is no longer running. Running ones are kept.
+tmp_root <- dirname(tempdir())
+if (grepl("^grass[0-9]+-", basename(tmp_root))) tmp_root <- dirname(tmp_root)   # R started from a GRASS prompt
+for (d in list.files(tmp_root, pattern = "^grass[0-9]+-.+-[0-9]+$", full.names = TRUE)) {
+  pid <- as.integer(sub(".*-", "", basename(d)))
+  alive <- system2("ps", c("-p", pid), stdout = FALSE, stderr = FALSE) == 0
+  if (!alive && !startsWith(tempdir(), d)) {
+    gb <- sum(file.info(list.files(d, recursive = TRUE, full.names = TRUE, all.files = TRUE))$size, na.rm = TRUE) / 1e9
+    unlink(d, recursive = TRUE)
+    message("Removed leftover temp folder ", basename(d), " (", round(gb, 1), " GB)")
   }
+}
 
-  region_url <- dsm_urls[[region]]
 
-  future_walk(seq_along(blocks_to_process), function(counter) {
+# ---- Process blocks in parallel ----
+plan(multisession, workers = n_workers)
+future_iwalk(
+  jobs,
+  function(job, counter) {
+    # Each worker gets its share of RAM (60% of the total, split across workers). Bigger rasters are processed in
+    # pieces via temp files, so workers don't all load whole blocks at once.
+    terraOptions(memmax = 0.6 * ram_gb / n_workers)
 
-    i        <- blocks_to_process[counter]
-    out_file <- file.path(out_dir, paste0(i, "_open.tif"))
+    # Per-block temp folder for terra's temporary rasters. It, rgrass's write_RAST handoff files (file*.grd/.gri)
+    # and the block's GRASS database are deleted when the block ends (finished or failed); otherwise several GB per
+    # block pile up for the worker's life.
+    blk_tmp <- file.path(tempdir(), paste0("blk_", Sys.getpid()))
+    dir.create(blk_tmp, showWarnings = FALSE)
+    terraOptions(tempdir = blk_tmp)
+    on.exit({
+      unlink(blk_tmp, recursive = TRUE)
+      # initGRASS() makes a new GRASS location (with this block's rasters) on every call; delete it after each block
+      unlink(file.path(td, paste0("grass_worker_", Sys.getpid())), recursive = TRUE)
+      unlink(list.files(tempdir(), pattern = "^file.*[.](grd|gri)$", full.names = TRUE))
+    }, add = TRUE)
+
+    i <- job$name
+    yr <- job$year
+    out_file <- job$out_file
+
+    # Ordinary worker messages only reach the console once results are collected (in order);
+    # "immediateCondition" messages are relayed as soon as they're sent
+    live_alert <- function(text) {
+      message(structure(class = c("immediateMessage", "immediateCondition", "message", "condition"),
+                        list(message = paste0(text, "\n"), call = NULL)))
+    }
+    now <- function() format(Sys.time(), "%H:%M:%S")
 
     if (file.exists(out_file)) {
-      cli_alert_info("Skipping block: {.val {i}} (file already exists)")
-      return(invisible(NULL))
-    }
-
-    blockbound <- blocks_subset[blocks_subset$BLOCKNAME == i, ]
-
-    agri_block <- tryCatch(
-      st_crop(VT_agr_22, blockbound),
-      error = function(e) {
-        sf::st_sf(geometry = sf::st_sfc(crs = st_crs(VT_agr_22)))
-      }
-    )
-
-    if (nrow(agri_block) == 0) {
-      cli_alert_warning("No hay/pasture in block {.val {i}} — skipping")
+      live_alert(format_inline("{col_cyan(symbol$info)} Skipping block: {.val {i}} [{yr}] (file already exists)"))
       return(invisible(NULL))
     }
 
     tryCatch({
+      # Eye-level surface: per cell, the higher of the DSM and DTM + eye height
+      block_v <- vect(job$blockbound)
+      dsm_cog <- crop(rast(job$dsm_url), buffer(project(block_v, crs(rast(job$dsm_url))), width = context_m))
+      dem_cog <- crop(rast(job$dem_url), dsm_cog)
+      if (!suppressWarnings(compareGeom(dem_cog, dsm_cog, stopOnError = FALSE))) {
+        dem_cog <- resample(dem_cog, dsm_cog, method = "bilinear")   # only if the grids don't line up
+      }
+      eye_surface <- max(dsm_cog, dem_cog + eye_height_m, na.rm = TRUE)
+      rm(dsm_cog, dem_cog)
 
-dsm_cog_url_worker <- rast(region_url)
-
-      dsm_cog <- crop(dsm_cog_url_worker, blockbound) %>%
-        project("EPSG:32145", method = "bilinear")
-
+      # GRASS: each worker uses its own GRASS database, so workers don't interfere
       unique_home <- file.path(td, paste0("grass_worker_", Sys.getpid()))
       dir.create(unique_home, showWarnings = FALSE, recursive = TRUE)
+      loc <- initGRASS(gisBase = grass_base,
+                       home = unique_home,
+                       gisDbase = unique_home,
+                       addon_base = addon_base,
+                       SG = eye_surface,
+                       override = TRUE)
 
-      loc <- initGRASS(
-        gisBase  = '/Applications/GRASS-8.2.app/Contents/Resources',
-        home     = unique_home,
-        SG       = dsm_cog,
-        override = TRUE
-      )
+      # "o": the temp file loses the CRS's datum name, so skip GRASS's projection check (CRS is identical)
+      write_RAST(eye_surface, vname = "rmask", flags = c("o", "overwrite"), verbose = FALSE)
+      rm(eye_surface); gc()   # GRASS has its own copy now
+      execGRASS("g.region", raster = "rmask")
+      skyview_args <- list("r.skyview", flags = c("o", "overwrite"), input = "rmask", output = "rmask.Open")
+      if (!is.null(max_dist_m)) skyview_args$maxdistance <- max_dist_m
+      skyview_args$nprocs <- nprocs_per_worker
+      do.call(execGRASS, skyview_args)
 
-      write_RAST(dsm_cog, vname = "rmask", flags = "overwrite")
-      execGRASS("r.skyview", flags = c("o", "overwrite"),
-                input = "rmask", output = "rmask.Open")
-
-      u1       <- read_RAST("rmask.Open")
-      hay_vect <- vect(agri_block)
-      u1       <- mask(u1, hay_vect)
+      u1 <- read_RAST("rmask.Open")
+      crs(u1) <- crs(rast(job$dsm_url))           # GRASS drops the datum name; restore the DSM's CRS
+      u1 <- crop(u1, project(block_v, crs(u1)))   # drop the context ring
       names(u1) <- "Open_decimal"
 
-      writeRaster(u1, out_file, overwrite = TRUE)
+      writeRaster(u1, out_file, overwrite = TRUE, datatype = "FLT4S", gdal = c("COMPRESS=DEFLATE", "PREDICTOR=3"))
+      live_alert(format_inline("{col_green(symbol$tick)} [{now()}] Finished block {.val {i}} [{yr}] ({.val {counter}}/{.val {get0('n_jobs', ifnotfound = '?')}})"))
 
-      cli_alert_success(
-        "Finished block {.val {i}} ({.val {counter}}/{.val {length(blocks_to_process)}}) [{region}]"
-      )
-
-      rm(u1, dsm_cog, dsm_cog_url_worker)
+      rm(u1)
       gc(full = TRUE)
 
     }, error = function(e) {
-      cli_alert_danger(
-        "***** FAILED ***** block: {.val {i}} [{region}] @ {.val {format(Sys.time(), '%Y-%m-%d %H:%M:%S')}} — {e$message}"
-      )
+      live_alert(format_inline("{col_red(symbol$cross)} [{now()}] ***** FAILED ***** block: {.val {i}} [{yr}] — {e$message}"))
     })
-  })
-}
-
+  },
+  .options = furrr_options(
+    globals  = c("n_jobs", "n_workers", "nprocs_per_worker", "ram_gb", "td", "grass_base", "addon_base",
+                 "eye_height_m", "context_m", "max_dist_m"),
+    packages = c("terra", "sf", "rgrass", "cli"),
+    scheduling = Inf,   # one block per future, so messages come back as each finishes
+    seed = TRUE,        # silences the "unexpectedly generated random numbers" warning (temp file names)
+    stdout = FALSE      # don't relay GRASS's console output
+  )
+)
 plan(sequential)
 
+for (yr in names(lidar_years)) {
+  missing <- sum(!file.exists(file.path(out_dirs[[yr]], paste0(blocks, "_open.tif"))))
+  message(yr, ": ", missing, " of ", length(blocks), " blocks still missing; re-run to retry")
+}
 
 
+# ==== Openness classes as polygons (optional) ====
+# Splits a block's openness tif into classes and dissolves each class into one (multi)polygon, with its area.
+# Intervals include their lower bound: < 0.8 | 0.8 to < 0.889 | >= 0.889
+# cell_size_m: optional; average the openness to coarser cells first. At 0.35 m a block makes very detailed
+#   (large, slow) polygons; e.g. 1.4 gives much simpler ones.
+open_breaks <- c(0.8, 0.889)
+open_labels <- c("<0.8", "0.8-0.889", ">=0.889")
+
+openness_polygons <- function(tif, breaks = open_breaks, labels = open_labels, cell_size_m = NULL) {
+  r <- rast(tif)
+  if (!is.null(cell_size_m) && cell_size_m > res(r)[1]) {
+    r <- aggregate(r, fact = round(cell_size_m / res(r)[1]), fun = "mean", na.rm = TRUE)
+  }
+  rcl <- cbind(c(-Inf, breaks), c(breaks, Inf), seq_along(labels))
+  classes <- classify(r, rcl, right = FALSE)   # right = FALSE: intervals are [lower, upper)
+  as.polygons(classes, dissolve = TRUE, na.rm = TRUE) %>%
+    st_as_sf() %>%
+    setNames(c("class_id", "geometry")) %>%
+    st_set_geometry("geometry") %>%
+    st_cast("MULTIPOLYGON") %>%   # one geometry type for every class
+    mutate(block = sub("_open[.]tif$", "", basename(tif)),
+           openness_class = factor(labels[class_id], levels = labels),
+           area_ha = as.numeric(st_area(geometry)) / 10000) %>%
+    dplyr::select(block, openness_class, area_ha)
+}
+
+# Every block tif for each year -> one .gpkg per block in <year folder>/polygons (skips blocks already done)
+for (yr in names(lidar_years)) {
+  poly_dir <- file.path(out_dirs[[yr]], "polygons")
+  dir.create(poly_dir, showWarnings = FALSE)
+  tifs <- list.files(out_dirs[[yr]], pattern = "_open[.]tif$", full.names = TRUE)
+  for (k in seq_along(tifs)) {
+    out_gpkg <- file.path(poly_dir, sub("_open[.]tif$", "_open_classes.gpkg", basename(tifs[k])))
+    if (file.exists(out_gpkg)) next
+    st_write(openness_polygons(tifs[k]), out_gpkg, quiet = TRUE)
+    cli_alert_success("[{yr}] {basename(out_gpkg)} ({k}/{length(tifs)})")
+  }
+}
